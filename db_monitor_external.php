@@ -1,107 +1,115 @@
 #!/usr/bin/php
 <?php
 /**
- * Skrip ini berfungsi untuk:
- * - Memonitor koneksi MySQL (fsockopen & MySQLi) dengan retry dan exponential backoff
- * - Mengirim notifikasi via Telegram jika terjadi kegagalan koneksi atau kondisi kritis lain
- * - Merestart MySQL secara otomatis, dengan pengecualian jika restart berulang
- * - Memulihkan pasca restart dan mengirim notifikasi sukses
- * - Mengecek disk usage, connection pool, integritas konfigurasi, dependency “cron” saja
- * - Auto–update script dari GitHub bila versi remote lebih baru
+ * db_monitor_external.php
  *
- * Silakan atur variabel environment seperti DB_MAX_RETRIES, TELEGRAM_TOKEN, NORMAL_NOTIFICATION, dsb.
+ * Memonitor MySQL & lingkungan, mengirim notifikasi Telegram (dengan emoji), restart otomatis,
+ * auto-update dari GitHub untuk skrip PHP & env shell, dan pengecekan kondisi lain (disk, pool, integritas, dependency "cron"),
+ * CPU, memory, security, dan update package.
+ *
+ * Untuk pakai:
+ * 1. Simpan sebagai db_monitor_external.php dan `chmod +x db_monitor_external.php`
+ * 2. Buat file telegram_config.json di folder yang sama dengan format:
+ *    {
+ *      "token": "TELEGRAM_BOT_TOKEN",
+ *      "chat_id": "CHAT_ID"
+ *    }
+ * 3. Buat file db_monitor_env.sh di folder yang sama (atau diatur melalui ENV) untuk variabel lingkungan.
+ * 4. Cronjob: `* * * * * source /path/to/db_monitor_env.sh && /usr/bin/php /path/to/db_monitor_external.php`
  */
 
 define('LOCAL_VERSION', '1.0.0');
 
 if (php_sapi_name() !== 'cli') {
-    die("Skrip hanya dapat dijalankan dari command line.\n");
+    die("? Skrip hanya dapat dijalankan dari command line.\n");
 }
 
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
 /**
- * Auto–update script: cek version.txt & script.php di GitHub
+ * Auto-update script PHP & shell dari GitHub jika versi remote lebih baru.
  */
 function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, $localVersion) {
-    $verUrl = "https://raw.githubusercontent.com/krisdwiantara12/db-monitor/refs/heads/main/version.txt";
-    $scriptUrl = "https://raw.githubusercontent.com/krisdwiantara12/db-monitor/refs/heads/main/script.php";
+    $verUrl    = "https://raw.githubusercontent.com/krisdwiantara12/db-monitor/refs/heads/main/version.txt";
+    $scriptUrl = "https://raw.githubusercontent.com/krisdwiantara12/db-monitor/refs/heads/main/db_monitor_external.php";
+    $envUrl    = "https://raw.githubusercontent.com/krisdwiantara12/db-monitor/refs/heads/main/db_monitor_env.sh";
+    $envFile   = __DIR__ . '/db_monitor_env.sh';
 
-    // ambil versi remote
+    // Ambil versi remote
     $ch = curl_init($verUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 5]);
     $remoteVer = trim(curl_exec($ch));
-    $err = curl_error($ch);
+    $err       = curl_error($ch);
     curl_close($ch);
+
     if (!$remoteVer) {
-        $logger->log("AutoUpdate: gagal ambil versi remote: $err");
+        $logger->log("? AutoUpdate: gagal ambil versi remote: $err");
         return;
     }
 
     if (version_compare($remoteVer, $localVersion, '>')) {
-        $logger->log("AutoUpdate: update dari v$localVersion → v$remoteVer");
+        $logger->log("?? AutoUpdate: v$localVersion -> v$remoteVer");
+        // Update PHP script
         $newScript = @file_get_contents($scriptUrl);
-        if (!$newScript) {
-            $logger->log("AutoUpdate: gagal ambil script baru");
-            return;
-        }
-
-        // backup & tulis
-        copy(__FILE__, __FILE__ . '.bak.' . time());
-        if (file_put_contents(__FILE__, $newScript) !== false) {
-            $msg = "🔄 Script diperbarui ke versi $remoteVer";
-            $logger->log("AutoUpdate: berhasil update");
-            $notifier->send($msg);
-            exit("Script di‑update ke v$remoteVer. Jalankan ulang.\n");
+        if ($newScript) {
+            copy(__FILE__, __FILE__ . '.bak.' . time());
+            file_put_contents(__FILE__, $newScript);
+            $notifier->send("?? <b>PHP script</b> diperbarui ke versi <b>$remoteVer</b>");
         } else {
-            $logger->log("AutoUpdate: gagal menulis file baru");
+            $logger->log("? AutoUpdate: gagal ambil PHP script baru");
         }
+        // Update env shell script
+        $newEnv = @file_get_contents($envUrl);
+        if ($newEnv) {
+            file_put_contents($envFile, $newEnv);
+            $logger->log("?? AutoUpdate: env shell diperbarui");
+            $notifier->send("?? <b>Env shell</b> diperbarui dari GitHub");
+        } else {
+            $logger->log("? AutoUpdate: gagal ambil env shell baru");
+        }
+        exit("?? Skrip dan env diperbarui ke v$remoteVer. Jalankan ulang.\n");
     } else {
-        $logger->log("AutoUpdate: sudah versi terbaru ($localVersion)");
+        $logger->log("? AutoUpdate: sudah versi terbaru ($localVersion)");
     }
 }
 
 /**
- * Konfigurasi umum
+ * Config dan thresholds
  */
 class Config {
     public $logDir, $logFile, $restartLogFile, $lastRestartFile, $lastErrorFile;
-    public $maxRetries, $retryDelay, $telegramToken, $telegramChatId;
-    public $autoRestart, $debug, $normalNotification;
-    public $wpConfigPath;
-    // threshold & parameter tambahan
-    public $diskThreshold, $connPoolThreshold;
-    public $dependenciesToCheck;
-    public $mysqlConfigPath, $hashFile;
-    public $maxRestarts, $restartPeriod;
+    public $maxRetries, $retryDelay, $autoRestart, $debug, $normalNotification;
+    public $diskThreshold, $connPoolThreshold, $cpuThreshold, $memThreshold, $loginFailThreshold;
+    public $dependenciesToCheck, $mysqlConfigPath, $hashFile, $maxRestarts, $restartPeriod;
+    public $telegramConfigPath;
 
     public function __construct() {
-        $this->logDir          = __DIR__ . '/log_db_monitor';
-        $this->logFile         = "$this->logDir/db-monitor-log.txt";
-        $this->restartLogFile  = "$this->logDir/restart-history.log";
-        $this->lastRestartFile = "$this->logDir/last_restart.txt";
-        $this->lastErrorFile   = "$this->logDir/last_error.json";
+        $this->logDir            = __DIR__ . '/log_db_monitor';
+        $this->logFile           = "$this->logDir/db-monitor-log.txt";
+        $this->restartLogFile    = "$this->logDir/restart-history.log";
+        $this->lastRestartFile   = "$this->logDir/last_restart.txt";
+        $this->lastErrorFile     = "$this->logDir/last_error.json";
+        $this->hashFile          = "$this->logDir/config_hashes.json";
 
-        $this->maxRetries       = getenv('DB_MAX_RETRIES')  ? (int)getenv('DB_MAX_RETRIES')  : 3;
-        $this->retryDelay       = getenv('DB_RETRY_DELAY')  ? (int)getenv('DB_RETRY_DELAY')  : 5;
-        $this->autoRestart      = getenv('AUTO_RESTART')    ? filter_var(getenv('AUTO_RESTART'), FILTER_VALIDATE_BOOLEAN) : true;
-        $this->debug            = getenv('DEBUG_MODE')      ? filter_var(getenv('DEBUG_MODE'), FILTER_VALIDATE_BOOLEAN) : false;
-        $this->normalNotification = getenv('NORMAL_NOTIFICATION') ? filter_var(getenv('NORMAL_NOTIFICATION'), FILTER_VALIDATE_BOOLEAN) : false;
+        $this->maxRetries        = getenv('DB_MAX_RETRIES')     ? (int)getenv('DB_MAX_RETRIES')    : 3;
+        $this->retryDelay        = getenv('DB_RETRY_DELAY')     ? (int)getenv('DB_RETRY_DELAY')    : 5;
+        $this->autoRestart       = getenv('AUTO_RESTART')       ? filter_var(getenv('AUTO_RESTART'), FILTER_VALIDATE_BOOLEAN) : true;
+        $this->debug             = getenv('DEBUG_MODE')         ? filter_var(getenv('DEBUG_MODE'), FILTER_VALIDATE_BOOLEAN)    : false;
+        $this->normalNotification= getenv('NORMAL_NOTIFICATION')? filter_var(getenv('NORMAL_NOTIFICATION'), FILTER_VALIDATE_BOOLEAN) : false;
 
-        $this->telegramToken    = getenv('TELEGRAM_TOKEN')  ?: '7943049250:AAHdnBwodrSmLqsETpZOgN89xERkpX-1Pkk';
-        $this->telegramChatId   = getenv('TELEGRAM_CHAT_ID') ?: '401856988';
+        $this->diskThreshold     = getenv('DISK_THRESHOLD')     ? (int)getenv('DISK_THRESHOLD')    : 90;
+        $this->connPoolThreshold = getenv('CONN_POOL_THRESHOLD') ? (int)getenv('CONN_POOL_THRESHOLD'): 80;
+        $this->cpuThreshold      = getenv('CPU_THRESHOLD')      ? (float)getenv('CPU_THRESHOLD')   : 1.0;
+        $this->memThreshold      = getenv('MEM_THRESHOLD')      ? (int)getenv('MEM_THRESHOLD')     : 90;
+        $this->loginFailThreshold= getenv('LOGIN_FAIL_THRESHOLD')? (int)getenv('LOGIN_FAIL_THRESHOLD'): 5;
 
-        $this->wpConfigPath     = __DIR__ . '/wp-config.php';
-
-        $this->diskThreshold    = getenv('DISK_THRESHOLD')    ? (int)getenv('DISK_THRESHOLD')    : 90;
-        $this->connPoolThreshold= getenv('CONN_POOL_THRESHOLD')? (int)getenv('CONN_POOL_THRESHOLD'): 80;
-        // hanya cek cron, php-fpm dihapus
         $this->dependenciesToCheck = explode(',', getenv('DEPENDENCIES') ?: 'cron');
-        $this->mysqlConfigPath  = getenv('MYSQL_CONFIG')      ?: '/etc/mysql/my.cnf';
-        $this->hashFile         = "$this->logDir/config_hashes.json";
-        $this->maxRestarts      = 3;
-        $this->restartPeriod    = 600; // detik
+        $this->mysqlConfigPath   = getenv('MYSQL_CONFIG')       ?: '/etc/mysql/my.cnf';
+
+        $this->maxRestarts       = 3;
+        $this->restartPeriod     = 600; // detik
+
+        $this->telegramConfigPath= __DIR__ . '/telegram_config.json';
 
         if (!is_dir($this->logDir)) {
             mkdir($this->logDir, 0755, true);
@@ -110,298 +118,339 @@ class Config {
 }
 
 /**
- * Logger dengan file locking
+ * Logger sederhana
  */
 class Logger {
     private $file;
     public function __construct($file) { $this->file = $file; }
     public function log($msg) {
-        $fp = fopen($this->file, 'a');
-        if ($fp && flock($fp, LOCK_EX)) {
-            fwrite($fp, "[".date('Y-m-d H:i:s')."] $msg\n");
-            fflush($fp);
-            flock($fp, LOCK_UN);
-        }
-        if ($fp) fclose($fp);
+        $entry = "[" . date('Y-m-d H:i:s') . "] $msg\n";
+        file_put_contents($this->file, $entry, FILE_APPEND | LOCK_EX);
     }
 }
 
 /**
- * Notifier Telegram via cURL
+ * Telegram Notifier, baca config dari JSON
  */
 class TelegramNotifier {
     private $token, $chatId, $logger;
-    public function __construct($t,$c,Logger $l){$this->token=$t;$this->chatId=$c;$this->logger=$l;}
-    public function send($text){
-        if(!$this->token||!$this->chatId){
-            $this->logger->log("Telegram token/chat kosong");return false;
+    public function __construct($configPath, Logger $logger) {
+        if (!file_exists($configPath)) throw new Exception("telegram_config.json tidak ditemukan");
+        $cfg = json_decode(file_get_contents($configPath), true);
+        if (empty($cfg['token']) || empty($cfg['chat_id'])) {
+            throw new Exception("Isi telegram_config.json tidak lengkap");
         }
+        $this->token  = $cfg['token'];
+        $this->chatId = $cfg['chat_id'];
+        $this->logger = $logger;
+    }
+    public function send($text) {
         $ch = curl_init("https://api.telegram.org/bot{$this->token}/sendMessage");
         curl_setopt_array($ch, [
-            CURLOPT_POST        => true,
-            CURLOPT_POSTFIELDS  => http_build_query(['chat_id'=>$this->chatId,'text'=>$text,'parse_mode'=>'HTML']),
+            CURLOPT_POST       => true,
+            CURLOPT_POSTFIELDS => http_build_query([
+                'chat_id'    => $this->chatId,
+                'text'       => $text,
+                'parse_mode' => 'HTML'
+            ]),
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT     => 5,
+            CURLOPT_TIMEOUT        => 5,
         ]);
         $res = curl_exec($ch);
         $err = curl_error($ch);
         curl_close($ch);
-        if(!$res) $this->logger->log("Telegram gagal: $err");
+        if (!$res) $this->logger->log("? Telegram gagal: $err");
         return (bool)$res;
     }
 }
 
 /**
- * Parser wp-config.php
+ * WP Config Parser
  */
 class WPConfigParser {
     private $file;
-    public function __construct($f){
-        if(!file_exists($f)) throw new Exception("wp-config.php tidak ditemukan");
-        $this->file=$f;
+    public function __construct($f) {
+        if (!file_exists($f)) throw new Exception("wp-config.php tidak ditemukan");
+        $this->file = $f;
     }
-    public function getConfigValue($key){
+    public function getConfigValue($key) {
         $d = file_get_contents($this->file);
-        if(preg_match("/define\\s*\\(\\s*['\"]".preg_quote($key,'/')."['\"]\\s*,\\s*['\"](.+?)['\"]\\s*\\)/",$d,$m))
+        if (preg_match("/define\s*\(\s*['\"]" . preg_quote($key, '/') . "['\"]\s*,\s*['\"](.+?)['\"]\s*\)/", $d, $m)) {
             return $m[1];
+        }
         return null;
     }
-    public function getSiteDomain(){
-        $h = $this->getConfigValue('WP_HOME')?:$this->getConfigValue('WP_SITEURL');
-        if($h && ($p=parse_url($h)) && !empty($p['host'])) return $p['host'];
-        // fallback ke hostname server
-        return gethostname()?:'localhost';
+    public function getSiteDomain() {
+        $h = $this->getConfigValue('WP_HOME') ?: $this->getConfigValue('WP_SITEURL');
+        if ($h && ($p = parse_url($h)) && !empty($p['host'])) return $p['host'];
+        return gethostname() ?: 'localhost';
     }
 }
 
 /**
- * Lock untuk single instance
+ * Single-instance lock
  */
 class ProcessLock {
-    private $file,$h;
-    public function __construct($f){$this->file=$f;}
-    public function acquire(){
-        $this->h=fopen($this->file,'c');
-        if(!$this->h||!flock($this->h,LOCK_EX|LOCK_NB)) throw new Exception("Skrip sedang berjalan");
-        ftruncate($this->h,0);
-        fwrite($this->h,getmypid());
+    private $file, $h;
+    public function __construct($f) { $this->file = $f; }
+    public function acquire() {
+        $this->h = fopen($this->file, 'c');
+        if (!$this->h || !flock($this->h, LOCK_EX | LOCK_NB)) throw new Exception("?? Skrip sedang berjalan");
+        ftruncate($this->h, 0);
+        fwrite($this->h, getmypid());
     }
-    public function release(){
-        if($this->h){ flock($this->h,LOCK_UN); fclose($this->h); }
+    public function release() {
+        if ($this->h) { flock($this->h, LOCK_UN); fclose($this->h); }
     }
 }
 
 /**
- * Core monitoring & notifikasi
+ * Core Monitor
  */
 class DatabaseMonitor {
-    private $cfg,$log,$notifier,$wp;
-    private $dbHost,$dbPort,$dbUser,$dbPass,$dbName,$site,$ip;
+    private $cfg, $log, $note, $wp;
+    private $dbHost, $dbPort, $dbUser, $dbPass, $dbName, $site, $ip;
 
-    public function __construct($cfg,$log,$notifier,$wp){
-        $this->cfg=$cfg; $this->log=$log; $this->notifier=$notifier; $this->wp=$wp;
+    public function __construct($cfg, $log, $note, $wp) {
+        $this->cfg  = $cfg;
+        $this->log  = $log;
+        $this->note = $note;
+        $this->wp   = $wp;
     }
-
-    private function writeErrorJson($d){ file_put_contents($this->cfg->lastErrorFile,json_encode($d,JSON_PRETTY_PRINT)); }
-    private function restartMySQL(){
-        $out=shell_exec("sudo systemctl restart mysql 2>&1");
-        $this->log->log("Restart: ".trim($out));
-        file_put_contents($this->cfg->restartLogFile,"[".date('Y-m-d H:i:s')."] $out\n",FILE_APPEND);
-        return trim($out)?:'Restart dikirim.';
+    private function writeErrorJson($data) {
+        file_put_contents($this->cfg->lastErrorFile, json_encode($data, JSON_PRETTY_PRINT));
     }
-    private function checkRestartAttempts(){
-        if(!file_exists($this->cfg->restartLogFile)) return false;
-        $lines=file($this->cfg->restartLogFile,FILE_IGNORE_NEW_LINES);
-        $cnt=0; $now=time();
-        foreach($lines as $l){
-            if(preg_match('/\[([^\]]+)\]/',$l,$m) && ($now-strtotime($m[1])<$this->cfg->restartPeriod)) $cnt++;
+    private function restartMySQL() {
+        $out = shell_exec("sudo systemctl restart mysql 2>&1");
+        $this->log->log("?? Restart: " . trim($out));
+        file_put_contents($this->cfg->restartLogFile, "[" . date('Y-m-d H:i:s') . "] $out\n", FILE_APPEND);
+        return trim($out) ?: 'Restart dikirim.';
+    }
+    private function checkRestartAttempts() {
+        if (!file_exists($this->cfg->restartLogFile)) return false;
+        $lines = file($this->cfg->restartLogFile, FILE_IGNORE_NEW_LINES);
+        $cnt   = 0;
+        $now   = time();
+        foreach ($lines as $l) {
+            if (preg_match('/\[([^\]]+)\]/', $l, $m) && ($now - strtotime($m[1]) < $this->cfg->restartPeriod)) {
+                $cnt++;
+            }
         }
-        if($cnt>=$this->cfg->maxRestarts){
-            $this->notifier->send("🚨 <b>{$this->site}</b> Gagal restart MySQL {$cnt}x dalam {$this->cfg->restartPeriod} detik!");
+        if ($cnt >= $this->cfg->maxRestarts) {
+            $this->note->send("? <b>{$this->site}</b> Gagal restart MySQL {$cnt}x dalam {$this->cfg->restartPeriod}s!");
             return true;
         }
         return false;
     }
-    private function handleError($type,$msg,$ctx){
-        $data=['site'=>$this->site,'ip'=>$this->ip,'time'=>date('Y-m-d H:i:s'),'error'=>$msg,'type'=>$type];
+    private function handleError($type, $msg, $ctx) {
+        $data = [
+            'site'  => $this->site,
+            'ip'    => $this->ip,
+            'time'  => date('Y-m-d H:i:s'),
+            'type'  => $type,
+            'error' => $msg
+        ];
         $this->writeErrorJson($data);
-        $this->log->log("ERROR($type): $msg");
-        $text="? <b>{$this->site}</b> GAGAL konek ".($type=='fsockopen'?'MySQL':'DB')." {$ctx} <pre>{$data['time']}\nServer: {$this->ip}\nError: $msg</pre>";
-        $this->notifier->send($text);
-        if($this->cfg->autoRestart){
-            if(!$this->checkRestartAttempts()){
-                $out=$this->restartMySQL();
-                touch($this->cfg->lastRestartFile);
-                $this->notifier->send("🔄 <b>{$this->site}</b> MySQL di‑restart.\n<pre>$out</pre>");
-            }
+        $this->log->log("? ERROR($type): $msg");
+        $text = "? <b>{$this->site}</b> GAGAL konek MySQL {$ctx}\n" .
+                "<pre>{$data['time']}\nServer: {$this->ip}\nError: $msg</pre>";
+        $this->note->send($text);
+        if ($this->cfg->autoRestart && ! $this->checkRestartAttempts()) {
+            $out = $this->restartMySQL();
+            touch($this->cfg->lastRestartFile);
+            $this->note->send("?? <b>{$this->site}</b> MySQL di-restart.\n<pre>$out</pre>");
         }
     }
-
-    public function testFsockopen($h,$p){
-        $t0=microtime(true);
-        $fp=@fsockopen($h,$p,$e,$s,3);
-        $dt=round((microtime(true)-$t0)*1000);
-        if(!$fp){
-            $this->handleError('fsockopen',$s,"($h:$p) {$dt}ms");
-            throw new Exception("FSOCKOPEN gagal: $s");
+    public function testFsockopen($host, $port) {
+        $t0 = microtime(true);
+        $fp = @fsockopen($host, $port, $errNo, $errStr, 3);
+        $dt = round((microtime(true) - $t0) * 1000);
+        if (! $fp) {
+            $this->handleError('fsockopen', $errStr, "({$host}:{$port}) {$dt}ms");
+            throw new Exception("FSOCKOPEN gagal: $errStr");
         }
         fclose($fp);
         return $dt;
     }
-
-    private function exponentialBackoff($a){ return $this->cfg->retryDelay * pow(2,$a-1); }
-
-    public function testMysqli(){
-        $last=''; $a=0;
-        while($a<$this->cfg->maxRetries){
-            $a++;
-            try{
-                $c=new mysqli($this->dbHost,$this->dbUser,$this->dbPass,$this->dbName,$this->dbPort);
-                if($c->connect_errno) throw new Exception($c->connect_error);
-                $c->close();
-                $this->log->log("✔ <b>{$this->site}</b> Koneksi MySQL normal. Percobaan: $a");
-                return $a;
-            }catch(Exception $e){
-                $last=$e->getMessage();
-                $this->log->log("Percobaan $a: $last");
-                if($a<$this->cfg->maxRetries) sleep($this->exponentialBackoff($a));
+    public function testMysqli() {
+        $attempt = 0;
+        while ($attempt < $this->cfg->maxRetries) {
+            $attempt++;
+            try {
+                $mysqli = new mysqli($this->dbHost, $this->dbUser, $this->dbPass, $this->dbName, $this->dbPort);
+                if ($mysqli->connect_errno) throw new Exception($mysqli->connect_error);
+                $mysqli->close();
+                $this->log->log("? <b>{$this->site}</b> Koneksi MySQL normal. Percobaan: $attempt");
+                return $attempt;
+            } catch (Exception $e) {
+                $msg = $e->getMessage();
+                $this->log->log("?? Percobaan $attempt: $msg");
+                if ($attempt < $this->cfg->maxRetries) {
+                    sleep(pow($this->cfg->retryDelay, $attempt - 1));
+                }
             }
         }
-        $this->handleError('mysqli',$last,"setelah {$a} percobaan");
-        throw new Exception("MySQL gagal konek setelah {$a} percobaan.");
+        $this->handleError('mysqli', $msg, "setelah {$attempt} percobaan");
+        throw new Exception("MySQL gagal konek setelah {$attempt} percobaan.");
     }
-
-    private function notifyRecovery(){
-        if(!file_exists($this->cfg->lastRestartFile)) return;
-        if(time()-filemtime($this->cfg->lastRestartFile)<=300){
-            $this->notifier->send("✅ <b>{$this->site}</b> MySQL pulih pasca restart");
+    private function notifyRecovery() {
+        if (file_exists($this->cfg->lastRestartFile) && time() - filemtime($this->cfg->lastRestartFile) <= 300) {
+            $this->note->send("? <b>{$this->site}</b> MySQL pulih pasca restart");
             unlink($this->cfg->lastRestartFile);
         }
     }
-
-    private function checkDiskUsage(){
-        $out=shell_exec("df -h /var/lib/mysql | tail -1");
-        if(preg_match('/\s(\d+)%\s/',$out,$m)){
-            $u=(int)$m[1];
-            if($u>$this->cfg->diskThreshold){
-                $msg="⚠️ <b>{$this->site}</b> Disk /var/lib/mysql {$u}%";
-                $this->notifier->send($msg);
-                $this->log->log("Disk: {$u}%");
+    private function checkDiskUsage() {
+        $out = shell_exec("df -h /var/lib/mysql | tail -1");
+        if (preg_match('/\s(\d+)%\s/', $out, $m)) {
+            $usage = (int)$m[1];
+            if ($usage > $this->cfg->diskThreshold) {
+                $this->note->send("?? <b>{$this->site}</b> Disk /var/lib/mysql {$usage}% penuh");
+                $this->log->log("Disk usage: {$usage}%");
             }
         }
     }
-
-    private function checkConnectionPool(){
-        try{
-            $c=new mysqli($this->dbHost,$this->dbUser,$this->dbPass,$this->dbName,$this->dbPort);
-            $v=$c->query("SHOW VARIABLES LIKE 'max_connections'")->fetch_assoc();
-            $s=$c->query("SHOW STATUS LIKE 'Threads_connected'")->fetch_assoc();
-            $c->close();
-            $pct=round($s['Value']/$v['Value']*100,1);
-            if($pct> $this->cfg->connPoolThreshold){
-                $msg="🔄 <b>{$this->site}</b> ConnPool {$s['Value']}/{$v['Value']} ({$pct}%)";
-                $this->notifier->send($msg);
-                $this->log->log("ConnPool: {$pct}%");
+    private function checkConnectionPool() {
+        try {
+            $mysqli = new mysqli($this->dbHost, $this->dbUser, $this->dbPass, $this->dbName, $this->dbPort);
+            $maxConn = $mysqli->query("SHOW VARIABLES LIKE 'max_connections'")->fetch_assoc()['Value'];
+            $used    = $mysqli->query("SHOW STATUS LIKE 'Threads_connected'")->fetch_assoc()['Value'];
+            $mysqli->close();
+            $pct = round($used / $maxConn * 100, 1);
+            if ($pct > $this->cfg->connPoolThreshold) {
+                $this->note->send("?? <b>{$this->site}</b> ConnPool {$used}/{$maxConn} ({$pct}% digunakan)");
+                $this->log->log("ConnPool usage: {$pct}%");
             }
-        }catch(Exception $e){}
+        } catch (Exception $e) {}
     }
-
-    private function checkConfigIntegrity(){
-        $files=[$this->cfg->wpConfigPath,$this->cfg->mysqlConfigPath];
-        $hsh=file_exists($this->cfg->hashFile)?json_decode(file_get_contents($this->cfg->hashFile),true):[];
-        foreach($files as $f){
-            if(!file_exists($f))continue;
-            $cur=md5_file($f);
-            $name=basename($f);
-            if(isset($hsh[$name]) && $hsh[$name]!==$cur){
-                $msg="🔧 <b>{$this->site}</b> Config {$name} berubah";
-                $this->notifier->send($msg);
-                $this->log->log("ConfigIntegrity: $name berubah");
+    private function checkConfigIntegrity() {
+        $files = [$this->cfg->wpConfigPath, $this->cfg->mysqlConfigPath];
+        $hashes = file_exists($this->cfg->hashFile) ? json_decode(file_get_contents($this->cfg->hashFile), true) : [];
+        foreach ($files as $f) {
+            if (!file_exists($f)) continue;
+            $current = md5_file($f);
+            $name    = basename($f);
+            if (isset($hashes[$name]) && $hashes[$name] !== $current) {
+                $this->note->send("?? <b>{$this->site}</b> Config file {$name} berubah");
+                $this->log->log("Config integrity: {$name} changed");
             }
-            $hsh[$name]=$cur;
+            $hashes[$name] = $current;
         }
-        file_put_contents($this->cfg->hashFile,json_encode($hsh));
+        file_put_contents($this->cfg->hashFile, json_encode($hashes));
     }
-
-    private function checkDependencies(){
-        foreach($this->cfg->dependenciesToCheck as $srv){
-            $st=trim(shell_exec("systemctl is-active $srv 2>/dev/null"));
-            if($st!=='active'){
-                $msg="⚙️ <b>{$this->site}</b> Layanan $srv tidak aktif";
-                $this->notifier->send($msg);
-                $this->log->log("DepCheck: $srv $st");
+    private function checkDependencies() {
+        foreach ($this->cfg->dependenciesToCheck as $svc) {
+            $status = trim(shell_exec("systemctl is-active {$svc} 2>/dev/null"));
+            if ($status !== 'active') {
+                $this->note->send("??? <b>{$this->site}</b> Service {$svc} not active ({$status})");
+                $this->log->log("Dependency check: {$svc} is {$status}");
             }
         }
     }
-
-    public function run(){
-        // baca DB config
-        $hostRaw=$this->wp->getConfigValue('DB_HOST')?:'localhost';
-        if(strpos($hostRaw,':')!==false){
-            list($this->dbHost,$p)=explode(':',$hostRaw,2);
-            $this->dbPort=(int)$p;
-        }else{
-            $this->dbHost=$hostRaw;
-            $this->dbPort=3306;
+    private function checkCpuLoad() {
+        $load = sys_getloadavg()[0];
+        if ($load > $this->cfg->cpuThreshold) {
+            $this->note->send("?? <b>{$this->site}</b> High load average: {$load}");
+            $this->log->log("CPU load: {$load}");
         }
-        $this->dbUser=$this->wp->getConfigValue('DB_USER')?:'user';
-        $this->dbPass=$this->wp->getConfigValue('DB_PASSWORD')?:'pass';
-        $this->dbName=$this->wp->getConfigValue('DB_NAME')?:'db';
+    }
+    private function checkMemoryUsage() {
+        $mem = shell_exec('free -m');
+        if (preg_match('/Mem:\s+(\d+)\s+(\d+)/', $mem, $m)) {
+            $total = (int)$m[1];
+            $used  = (int)$m[2];
+            $pct   = round($used / $total * 100, 1);
+            if ($pct > $this->cfg->memThreshold) {
+                $this->note->send("?? <b>{$this->site}</b> High memory usage: {$used}MB/{$total}MB ({$pct}% used)");
+                $this->log->log("Memory usage: {$pct}%");
+            }
+        }
+    }
+    private function checkSecurity() {
+        $count = (int)trim(shell_exec("journalctl -u ssh --since '5 minutes ago' | grep 'Failed password' | wc -l"));
+        if ($count > $this->cfg->loginFailThreshold) {
+            $this->note->send("?? <b>{$this->site}</b> Detected {$count} failed SSH logins in 5 minutes");
+            $this->log->log("Security check: {$count} failed SSH logins");
+        }
+    }
+    private function checkPackageUpdates() {
+        $pending = (int)trim(shell_exec("apt-get -s upgrade | grep '^Inst' | wc -l"));
+        if ($pending > 0) {
+            $this->note->send("?? <b>{$this->site}</b> {$pending} packages can be updated");
+            $this->log->log("Package updates: {$pending}");
+        }
+    }
+    public function run() {
+        // Ambil konfigurasi DB dari wp-config
+        $raw = $this->wp->getConfigValue('DB_HOST') ?: 'localhost';
+        if (strpos($raw, ':') !== false) {
+            list($host, $port) = explode(':', $raw, 2);
+            $this->dbHost = $host;
+            $this->dbPort = (int)$port;
+        } else {
+            $this->dbHost = $raw;
+            $this->dbPort = 3306;
+        }
+        $this->dbUser = $this->wp->getConfigValue('DB_USER')     ?: 'user';
+        $this->dbPass = $this->wp->getConfigValue('DB_PASSWORD') ?: 'pass';
+        $this->dbName = $this->wp->getConfigValue('DB_NAME')     ?: 'db';
 
         $this->site = $this->wp->getSiteDomain();
         $this->ip   = gethostbyname(gethostname());
 
-        // auto–update
-        autoUpdateScript($this->log,$this->notifier,LOCAL_VERSION);
+        // Auto-update
+        autoUpdateScript($this->log, $this->note, LOCAL_VERSION);
 
-        // cek koneksi
-        $this->testFsockopen($this->dbHost,$this->dbPort);
+        // Cek koneksi jaringan & MySQL
+        $this->testFsockopen($this->dbHost, $this->dbPort);
         try {
-            $a = $this->testMysqli();
-            $msg = "? <b>{$this->site}</b> Koneksi normal. Percobaan: $a";
-            echo "$msg\n";
-            if($this->cfg->normalNotification) {
-                $this->notifier->send($msg);
+            $attempts = $this->testMysqli();
+            $msg = "? <b>{$this->site}</b> Koneksi normal. Percobaan: {$attempts}";
+            echo $msg . "\n";
+            if ($this->cfg->normalNotification) {
+                $this->note->send($msg);
             }
-        } catch(Exception $e) {
-            echo $e->getMessage()."\n";
+        } catch (Exception $e) {
+            echo $e->getMessage() . "\n";
         }
 
-        // fitur tambahan
+        // Pengecekan tambahan
         $this->notifyRecovery();
         $this->checkDiskUsage();
         $this->checkConnectionPool();
         $this->checkConfigIntegrity();
         $this->checkDependencies();
+        $this->checkCpuLoad();
+        $this->checkMemoryUsage();
+        $this->checkSecurity();
+        $this->checkPackageUpdates();
 
-        if($this->cfg->debug){
-            echo $this->getSystemInfo()."\n";
+        if ($this->cfg->debug) {
+            echo $this->getSystemInfo() . "\n";
         }
     }
-
-    public function getSystemInfo(){
-        $l = sys_getloadavg()[0];
-        $m = stripos(PHP_OS,'win')===false?shell_exec('free -m'):'Mem info N/A';
-        return "Load: $l | Mem:\n$m";
+    public function getSystemInfo() {
+        $load = sys_getloadavg()[0];
+        $memInfo = stripos(PHP_OS, 'WIN') === false ? shell_exec('free -m') : 'Mem info N/A';
+        return "Load: {$load} | Mem:\n{$memInfo}";
     }
 }
 
-/* === EKSEKUSI UTAMA === */
+/* ===== EKSEKUSI ===== */
 try {
-    $lock = new ProcessLock('/tmp/db_monitor.lock');
+    $lock = new ProcessLock('/tmp/db_monitor_external.lock');
     $lock->acquire();
-    register_shutdown_function(function() use($lock){ $lock->release(); });
+    register_shutdown_function(function() use ($lock) { $lock->release(); });
 
-    $cfg   = new Config();
-    $log   = new Logger($cfg->logFile);
-    $note  = new TelegramNotifier($cfg->telegramToken, $cfg->telegramChatId, $log);
-    $wp    = new WPConfigParser($cfg->wpConfigPath);
+    $cfg  = new Config();
+    $log  = new Logger($cfg->logFile);
+    $note = new TelegramNotifier($cfg->telegramConfigPath, $log);
+    $wp   = new WPConfigParser($cfg->wpConfigPath);
 
-    $mon   = new DatabaseMonitor($cfg,$log,$note,$wp);
+    $mon = new DatabaseMonitor($cfg, $log, $note, $wp);
     $mon->run();
 
-} catch(Exception $ex) {
+} catch (Exception $ex) {
     error_log($ex->getMessage());
-    echo $ex->getMessage()."\n";
+    echo $ex->getMessage() . "\n";
     exit(1);
 }
