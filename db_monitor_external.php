@@ -3,13 +3,13 @@
 /**
  * db_monitor_external.php
  *
- * Versi Revisi: 2.2.2 (Optimal Tanpa Pre-Backup)
+ * Versi Revisi: 2.3.0 (Pembaruan Aman untuk PHP & SH)
  * Fitur Unggulan Revisi:
- * - [DIHILANGKAN] Fitur backup database otomatis sebelum restart MySQL dihilangkan sesuai permintaan.
- * - [BARU] Pengecekan keamanan tambahan via command `lastb`.
- * - [BARU] Pengecekan performa MySQL tambahan: monitoring 'Aborted_connects'.
- * - [BARU] Pemantauan path disk yang dinamis dan bisa dikonfigurasi.
- * - Menggunakan typed properties pada class untuk kualitas kode yang lebih baik (PHP 7.4+).
+ * - [DIUBAH] Mekanisme auto-update kini juga mengunduh template 'db_monitor_env.sh' terbaru
+ * sebagai 'db_monitor_env.sh.new' tanpa menimpa konfigurasi pengguna.
+ * - [DIHILANGKAN] Fitur backup otomatis sebelum restart MySQL.
+ * - [BARU] Pengecekan keamanan via `lastb`, performa MySQL 'Aborted_connects', path disk dinamis.
+ * - Menggunakan typed properties (PHP 7.4+).
  *
  * Versi Sebelumnya:
  * - Konfigurasi terpusat via environment variables
@@ -17,7 +17,7 @@
  * - Monitoring: MySQL (koneksi, auto-restart), Performa, Disk, CPU, Memori, Keamanan, WordPress
  */
 
-define('LOCAL_VERSION', '2.2.2'); // Versi diperbarui
+define('LOCAL_VERSION', '2.3.0'); // Versi diperbarui
 
 define('EXIT_SUCCESS', 0);
 define('EXIT_UPDATED', 0);
@@ -69,8 +69,6 @@ class Config {
     public bool $enableLastbCheck;
     public int $mysqlAbortedConnectsThreshold;
     
-    // Properti terkait backup MySQL dihilangkan
-    
     private function getEnv(string $varName, $defaultValue = null) {
         $value = getenv($varName);
         if ($value === false && isset($GLOBALS['loggerGlobal']) && $GLOBALS['loggerGlobal'] instanceof Logger) {
@@ -118,8 +116,6 @@ class Config {
         $this->mysqlCheckSlowQueryMinutes= (int) $this->getEnv('ENV_MYSQL_CHECK_SLOW_QUERY_MINUTES', 60);
         $this->mysqlAbortedConnectsThreshold = (int) $this->getEnv('ENV_MYSQL_ABORTED_CONNECTS_THRESHOLD', 10);
         
-        // Konfigurasi untuk pre-restart backup dihilangkan
-        
         $this->enableSmartCheck     = $this->getEnvBool('ENV_ENABLE_SMART_CHECK', true);
         $this->smartctlPath         = $this->getEnv('ENV_SMARTCTL_PATH', 'smartctl');
         $this->diskDevicesToCheck   = $this->getEnv('ENV_DISK_DEVICES_TO_CHECK', '/dev/sda');
@@ -163,7 +159,6 @@ class Config {
     }
 }
 
-// ... (Class Logger, TelegramNotifier, WPConfigParser, ProcessLock, autoUpdateScript tidak berubah)
 class Logger {
     private string $file;
     private bool $debugMode;
@@ -340,35 +335,92 @@ class ProcessLock {
     public function __destruct() { $this->release(); }
 }
 
+/**
+ * Memeriksa dan menjalankan pembaruan otomatis dari GitHub.
+ * Versi baru ini juga mengunduh template .sh terbaru tanpa menimpa konfigurasi pengguna.
+ *
+ * @param Logger $logger
+ * @param TelegramNotifier $notifier
+ * @param Config $config
+ * @param string $currentVersion
+ * @param string $serverName
+ * @return void
+ */
 function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, Config $config, string $currentVersion, string $serverName): void {
     $baseUrl = 'https://raw.githubusercontent.com/' . $config->githubRepo . '/' . $config->githubBranch;
+    
+    // URL untuk file PHP dan file .sh
     $versionUrl = $baseUrl . '/version.txt';
-    $scriptUrl = $baseUrl . '/' . basename(__FILE__);
+    $phpScriptUrl = $baseUrl . '/' . basename(__FILE__);
+    $envScriptUrl = $baseUrl . '/db_monitor_env.sh';
+    $envScriptNewName = __DIR__ . '/db_monitor_env.sh.new';
 
     try {
         $logger->log("Mengecek update dari {$config->githubRepo} cabang {$config->githubBranch}...");
         $remoteVersion = trim(@file_get_contents($versionUrl));
-        if (!$remoteVersion) { $logger->log("Gagal mengambil versi remote. Auto-update dilewati."); return; }
+        if (!$remoteVersion) {
+            $logger->log("Gagal mengambil versi remote. Auto-update dilewati.");
+            return;
+        }
         $logger->log("Versi lokal: {$currentVersion}, Versi remote: {$remoteVersion}");
 
         if (version_compare($remoteVersion, $currentVersion, '>')) {
-            $logger->log("Memulai auto-update dari v{$currentVersion} ke v{$remoteVersion}");
-            $notifier->send("🔔 Memulai auto-update script ke v{$remoteVersion}...", $serverName);
+            $updateMessage = "🔔 Memulai auto-update script ke v{$remoteVersion}...";
+            $logger->log($updateMessage);
+            $notifier->send($updateMessage, $serverName);
+
+            // 1. Update file PHP (seperti sebelumnya)
             $backupFile = __FILE__ . '.bak.' . time();
-            if (!copy(__FILE__, $backupFile)) { throw new Exception("Gagal membuat backup script ke {$backupFile}"); }
-            $logger->log("Backup script lama disimpan di: {$backupFile}");
-            $newScript = @file_get_contents($scriptUrl);
-            if ($newScript) {
-                if (file_put_contents(__FILE__, $newScript) === false) { throw new Exception("Gagal menulis script baru ke " . __FILE__); }
-                $logger->log("Script berhasil di-update ke v{$remoteVersion}. Skrip akan dijalankan ulang.");
-                $notifier->send("✅ Script berhasil di-update ke v{$remoteVersion}! Akan dijalankan ulang oleh scheduler.", $serverName);
-                exit(EXIT_UPDATED); 
+            if (!copy(__FILE__, $backupFile)) {
+                throw new Exception("Gagal membuat backup script PHP ke {$backupFile}");
             }
-            throw new Exception("Gagal mengambil konten script baru dari {$scriptUrl}");
-        } else { $logger->log("Script sudah versi terbaru."); }
+            $logger->log("Backup script PHP lama disimpan di: {$backupFile}");
+
+            $newPhpScript = @file_get_contents($phpScriptUrl);
+            if (!$newPhpScript) {
+                throw new Exception("Gagal mengambil konten script PHP baru dari {$phpScriptUrl}");
+            }
+            if (file_put_contents(__FILE__, $newPhpScript) === false) {
+                throw new Exception("Gagal menulis script PHP baru ke " . __FILE__);
+            }
+            $logger->log("Script PHP berhasil di-update ke v{$remoteVersion}.");
+
+            // 2. Unduh template .sh baru tanpa menimpa
+            $newEnvScript = @file_get_contents($envScriptUrl);
+            $envUpdateSuccess = false;
+            if ($newEnvScript) {
+                if (file_put_contents($envScriptNewName, $newEnvScript) !== false) {
+                    $logger->log("Template konfigurasi baru berhasil diunduh sebagai: {$envScriptNewName}");
+                    $envUpdateSuccess = true;
+                } else {
+                    $logger->log("Gagal menyimpan template konfigurasi baru ke {$envScriptNewName}", "ERROR");
+                }
+            } else {
+                $logger->log("Gagal mengambil template konfigurasi baru dari {$envScriptUrl}", "WARNING");
+            }
+
+            // 3. Kirim notifikasi final yang komprehensif
+            $finalMessage = "✅ **Script PHP berhasil di-update ke v{$remoteVersion}!**\n";
+            if ($envUpdateSuccess) {
+                $finalMessage .= "📄 Template konfigurasi baru (`db_monitor_env.sh.new`) juga telah diunduh.\n\n";
+                $finalMessage .= "<b>TINDAKAN DIPERLUKAN:</b> Harap bandingkan file `db_monitor_env.sh` Anda dengan `db_monitor_env.sh.new` untuk melihat apakah ada variabel baru yang perlu ditambahkan.";
+            } else {
+                $finalMessage .= "📄 Gagal mengunduh template konfigurasi baru. Periksa log untuk detail.";
+            }
+            $finalMessage .= "\n\nSkrip akan dijalankan ulang oleh cron/scheduler.";
+
+            $notifier->send($finalMessage, $serverName);
+            
+            // 4. Keluar agar proses dijalankan ulang dari awal oleh cron
+            exit(EXIT_UPDATED);
+
+        } else {
+            $logger->log("Script sudah versi terbaru (v{$currentVersion}).");
+        }
     } catch (Exception $e) {
-        $logger->log("Auto–update error: " . $e->getMessage(), "ERROR");
-        $notifier->send("❌ Auto-update GAGAL: " . $e->getMessage(), $serverName);
+        $errorMessage = "❌ Auto-update GAGAL: " . $e->getMessage();
+        $logger->log($errorMessage, "ERROR");
+        $notifier->send($errorMessage, $serverName);
     }
 }
 
@@ -467,8 +519,6 @@ class DatabaseMonitor {
         }
     }
 
-    // Metode backupMySQLDatabase() telah dihilangkan
-
     private function restartMySQL() {
         $this->logger->log("Mencoba me-restart MySQL service (tanpa backup)...");
         $finalOutput = '';
@@ -517,7 +567,6 @@ class DatabaseMonitor {
         }
     }
     
-    // ... (checkSystemLoad, getMemoryUsageInfo, checkMemoryUsage, commandExists, checkSecurity, checkMySQLPerformance, checkDiskSMART, checkWPDebugLog sama persis dengan versi sebelumnya yang optimal)
     private function checkSystemLoad() { 
         $threshold = $this->config->cpuThresholdLoadAvg; $load = sys_getloadavg(); $load1Min = $load[0];
         $this->logger->log("CPU load average (1 min): {$load1Min}");
@@ -534,7 +583,7 @@ class DatabaseMonitor {
             $this->logger->log("/proc/meminfo tidak terbaca. Fallback ke 'free -m'.", "WARNING");
             $output = $this->executeCommand("free -m", "Gagal 'free -m'");
             if ($output && preg_match('/Mem:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/', $output, $matches)) {
-                $total = (int)$matches[1]; $used = (int)$matches[2]; 
+                $total = (int)$matches[1];
                 $available = (int)($matches[6] ?? ($matches[3] + $matches[5]));
                 $actualUsed = $total - $available; $percent = ($total > 0) ? round(($actualUsed / $total) * 100) : 0;
                 return ['total_mb' => $total, 'used_mb' => $actualUsed, 'percent' => $percent];
@@ -652,6 +701,7 @@ class DatabaseMonitor {
     }
     
     private function checkDiskSMART() { 
+        if ($this->config->enableSmartCheck === false) { return; }
         $smartctlCmd = $this->config->smartctlPath;
         if (!$this->commandExists($smartctlCmd)) { $this->logger->log("smartctl tidak ada. Cek SMART dilewati.", "WARNING"); return; }
         if (empty($this->config->diskDevicesToCheck)) { return; }
@@ -662,8 +712,8 @@ class DatabaseMonitor {
                 if (preg_match("/SMART overall-health self-assessment test result: PASSED/i", $output)) { $this->logger->log("SMART {$device}: PASSED"); }
                 elseif (preg_match("/(FAILED|FAILING_NOW|PRE-FAIL_NOW)/i", $output)) {
                     $this->sendAlert("💥", "Disk SMART Failure", "Status SMART {$device} menunjukkan FAILED/FAILING.", "Disk mungkin segera rusak! Segera backup & ganti.");
-                } elseif (stripos($output, "SMART support is: Disabled") !== false) { 
-                    $this->sendAlert("❓", "Disk SMART Disabled", "SMART support disabled untuk {$device}.", "Enable SMART jika didukung.", "WARNING"); 
+                } elseif (stripos($output, "SMART support is: Disabled") !== false || stripos($output, "Not supported") !== false) { 
+                    $this->logger->log("SMART untuk {$device} tidak didukung atau dinonaktifkan, peringatan tidak dikirim.", "INFO");
                 }
             }
         }
