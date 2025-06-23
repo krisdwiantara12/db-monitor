@@ -65,4 +65,4 @@ export ENV_WP_CHECK_DEBUG_LOG_MINUTES=60
 export ENV_GITHUB_REPO="krisdwiantara12/db-monitor"
 export ENV_GITHUB_BRANCH="main"
 
-echo "Environment variables (v2.2.1) for db_monitor_external.php loaded."
+echo "Environment variables (v2.2.2) for db_monitor_external.php loaded."
