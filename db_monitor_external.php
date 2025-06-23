@@ -3,7 +3,7 @@
 /**
  * db_monitor_external.php
  *
- * Versi Revisi: 2.2.1 (Optimal Tanpa Pre-Backup)
+ * Versi Revisi: 2.2.2 (Optimal Tanpa Pre-Backup)
  * Fitur Unggulan Revisi:
  * - [DIHILANGKAN] Fitur backup database otomatis sebelum restart MySQL dihilangkan sesuai permintaan.
  * - [BARU] Pengecekan keamanan tambahan via command `lastb`.
@@ -17,7 +17,7 @@
  * - Monitoring: MySQL (koneksi, auto-restart), Performa, Disk, CPU, Memori, Keamanan, WordPress
  */
 
-define('LOCAL_VERSION', '2.2.1'); // Versi diperbarui
+define('LOCAL_VERSION', '2.2.2'); // Versi diperbarui
 
 define('EXIT_SUCCESS', 0);
 define('EXIT_UPDATED', 0);
