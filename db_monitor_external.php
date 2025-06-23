@@ -3,21 +3,19 @@
 /**
  * db_monitor_external.php
  *
- * Versi Revisi: 2.3.0 (Pembaruan Aman untuk PHP & SH)
- * Fitur Unggulan Revisi:
- * - [DIUBAH] Mekanisme auto-update kini juga mengunduh template 'db_monitor_env.sh' terbaru
- * sebagai 'db_monitor_env.sh.new' tanpa menimpa konfigurasi pengguna.
- * - [DIHILANGKAN] Fitur backup otomatis sebelum restart MySQL.
- * - [BARU] Pengecekan keamanan via `lastb`, performa MySQL 'Aborted_connects', path disk dinamis.
- * - Menggunakan typed properties (PHP 7.4+).
+ * Versi Final: 3.0.0 (Stabil)
  *
- * Versi Sebelumnya:
- * - Konfigurasi terpusat via environment variables
- * - Notifikasi Telegram, Auto–update dari GitHub
- * - Monitoring: MySQL (koneksi, auto-restart), Performa, Disk, CPU, Memori, Keamanan, WordPress
+ * Rangkuman Fitur:
+ * - Mekanisme auto-update yang aman untuk file .php (overwrite) dan .sh (unduh sebagai .new).
+ * - Logika auto-update diperbaiki untuk memastikan semua file diunduh sebelum proses berhenti.
+ * - Pengecekan SMART disk dioptimalkan untuk lingkungan cloud untuk mengurangi alarm palsu.
+ * - Tanpa fitur backup database otomatis sebelum restart MySQL.
+ * - Peningkatan keamanan (cek `lastb`) dan performa (cek `Aborted_connects`).
+ * - Konfigurasi terpusat dan fleksibel via db_monitor_env.sh.
+ * - Semua fitur standar lainnya (Monitoring Koneksi, Disk, CPU, Memori, Log WordPress, Notifikasi Telegram).
  */
 
-define('LOCAL_VERSION', '2.3.0'); // Versi diperbarui
+define('LOCAL_VERSION', '3.0.0');
 
 define('EXIT_SUCCESS', 0);
 define('EXIT_UPDATED', 0);
@@ -68,7 +66,7 @@ class Config {
     public string $extraDiskPathsToCheck;
     public bool $enableLastbCheck;
     public int $mysqlAbortedConnectsThreshold;
-    
+
     private function getEnv(string $varName, $defaultValue = null) {
         $value = getenv($varName);
         if ($value === false && isset($GLOBALS['loggerGlobal']) && $GLOBALS['loggerGlobal'] instanceof Logger) {
@@ -92,7 +90,7 @@ class Config {
         $this->telegramTokenEnv        = $this->getEnv('ENV_TELEGRAM_TOKEN', null);
         $this->telegramChatIdEnv       = $this->getEnv('ENV_TELEGRAM_CHAT_ID', null);
         $this->telegramConfigJsonPath  = $this->getEnv('ENV_TELEGRAM_CONFIG_JSON_PATH', 'telegram_config.json');
-        
+
         $this->maxRetries           = (int) $this->getEnv('ENV_DB_MAX_RETRIES', 3);
         $this->retryDelaySeconds    = (int) $this->getEnv('ENV_DB_RETRY_DELAY', 5);
         $this->mysqlAutoRestart     = $this->getEnvBool('ENV_MYSQL_AUTO_RESTART', true);
@@ -101,7 +99,7 @@ class Config {
         $this->memThresholdPercent  = (int) $this->getEnv('ENV_MEM_THRESHOLD_PERCENT', 90);
         $this->extraDiskPathsToCheck = $this->getEnv('ENV_EXTRA_PATHS_TO_CHECK', '/home,/var/log');
 
-        $this->loginFailThreshold   = (int) $this->getEnv('ENV_LOGIN_FAIL_THRESHOLD', 5);
+        $this->loginFailThreshold   = (int) $this->getEnv('ENV_LOGIN_FAIL_THRESHOLD', 10);
         $this->autoBlockIp          = $this->getEnvBool('ENV_AUTO_BLOCK_IP', true);
         $this->fail2banJailName     = $this->getEnv('ENV_FAIL2BAN_JAIL_NAME', 'sshd');
         $this->fail2banClientPath   = $this->getEnv('ENV_FAIL2BAN_CLIENT_PATH', 'fail2ban-client');
@@ -115,8 +113,8 @@ class Config {
         $this->mysqlSlowQueryLogPath     = $this->getEnv('ENV_MYSQL_SLOW_QUERY_LOG_PATH', null);
         $this->mysqlCheckSlowQueryMinutes= (int) $this->getEnv('ENV_MYSQL_CHECK_SLOW_QUERY_MINUTES', 60);
         $this->mysqlAbortedConnectsThreshold = (int) $this->getEnv('ENV_MYSQL_ABORTED_CONNECTS_THRESHOLD', 10);
-        
-        $this->enableSmartCheck     = $this->getEnvBool('ENV_ENABLE_SMART_CHECK', true);
+
+        $this->enableSmartCheck     = $this->getEnvBool('ENV_ENABLE_SMART_CHECK', false); // Default false untuk cloud
         $this->smartctlPath         = $this->getEnv('ENV_SMARTCTL_PATH', 'smartctl');
         $this->diskDevicesToCheck   = $this->getEnv('ENV_DISK_DEVICES_TO_CHECK', '/dev/sda');
 
@@ -337,7 +335,7 @@ class ProcessLock {
 
 /**
  * Memeriksa dan menjalankan pembaruan otomatis dari GitHub.
- * Versi baru ini juga mengunduh template .sh terbaru tanpa menimpa konfigurasi pengguna.
+ * Versi 3.0.0: Memperbaiki alur agar file .sh.new benar-benar diunduh.
  *
  * @param Logger $logger
  * @param TelegramNotifier $notifier
@@ -349,7 +347,6 @@ class ProcessLock {
 function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, Config $config, string $currentVersion, string $serverName): void {
     $baseUrl = 'https://raw.githubusercontent.com/' . $config->githubRepo . '/' . $config->githubBranch;
     
-    // URL untuk file PHP dan file .sh
     $versionUrl = $baseUrl . '/version.txt';
     $phpScriptUrl = $baseUrl . '/' . basename(__FILE__);
     $envScriptUrl = $baseUrl . '/db_monitor_env.sh';
@@ -369,24 +366,32 @@ function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, Config $co
             $logger->log($updateMessage);
             $notifier->send($updateMessage, $serverName);
 
-            // 1. Update file PHP (seperti sebelumnya)
+            // 1. Unduh SEMUA file yang diperlukan terlebih dahulu ke variabel
+            $newPhpScript = @file_get_contents($phpScriptUrl);
+            if (!$newPhpScript) {
+                throw new Exception("Gagal mengambil konten script PHP baru dari {$phpScriptUrl}");
+            }
+
+            $newEnvScript = @file_get_contents($envScriptUrl);
+            if (!$newEnvScript) {
+                $logger->log("Gagal mengambil template konfigurasi baru dari {$envScriptUrl}", "WARNING");
+            }
+
+            // 2. Jika unduhan utama (PHP) berhasil, lanjutkan proses backup dan penimpaan
+            // Backup file PHP lama
             $backupFile = __FILE__ . '.bak.' . time();
             if (!copy(__FILE__, $backupFile)) {
                 throw new Exception("Gagal membuat backup script PHP ke {$backupFile}");
             }
             $logger->log("Backup script PHP lama disimpan di: {$backupFile}");
 
-            $newPhpScript = @file_get_contents($phpScriptUrl);
-            if (!$newPhpScript) {
-                throw new Exception("Gagal mengambil konten script PHP baru dari {$phpScriptUrl}");
-            }
+            // Tulis file PHP baru
             if (file_put_contents(__FILE__, $newPhpScript) === false) {
                 throw new Exception("Gagal menulis script PHP baru ke " . __FILE__);
             }
             $logger->log("Script PHP berhasil di-update ke v{$remoteVersion}.");
 
-            // 2. Unduh template .sh baru tanpa menimpa
-            $newEnvScript = @file_get_contents($envScriptUrl);
+            // Tulis file .sh.new jika unduhan berhasil
             $envUpdateSuccess = false;
             if ($newEnvScript) {
                 if (file_put_contents($envScriptNewName, $newEnvScript) !== false) {
@@ -395,8 +400,6 @@ function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, Config $co
                 } else {
                     $logger->log("Gagal menyimpan template konfigurasi baru ke {$envScriptNewName}", "ERROR");
                 }
-            } else {
-                $logger->log("Gagal mengambil template konfigurasi baru dari {$envScriptUrl}", "WARNING");
             }
 
             // 3. Kirim notifikasi final yang komprehensif
@@ -408,10 +411,9 @@ function autoUpdateScript(Logger $logger, TelegramNotifier $notifier, Config $co
                 $finalMessage .= "📄 Gagal mengunduh template konfigurasi baru. Periksa log untuk detail.";
             }
             $finalMessage .= "\n\nSkrip akan dijalankan ulang oleh cron/scheduler.";
-
             $notifier->send($finalMessage, $serverName);
             
-            // 4. Keluar agar proses dijalankan ulang dari awal oleh cron
+            // 4. Perintah exit sekarang ada di paling akhir setelah semua proses selesai
             exit(EXIT_UPDATED);
 
         } else {
@@ -709,11 +711,12 @@ class DatabaseMonitor {
             $device = trim($device); if (empty($device)) continue;
             $output = $this->executeCommand("sudo {$smartctlCmd} -H " . escapeshellarg($device));
             if ($output) {
-                if (preg_match("/SMART overall-health self-assessment test result: PASSED/i", $output)) { $this->logger->log("SMART {$device}: PASSED"); }
-                elseif (preg_match("/(FAILED|FAILING_NOW|PRE-FAIL_NOW)/i", $output)) {
+                if (preg_match("/SMART overall-health self-assessment test result: PASSED/i", $output)) {
+                    $this->logger->log("SMART {$device}: PASSED");
+                } elseif (preg_match("/(FAILED|FAILING_NOW|PRE-FAIL_NOW)/i", $output) && stripos($output, "Not supported") === false) {
                     $this->sendAlert("💥", "Disk SMART Failure", "Status SMART {$device} menunjukkan FAILED/FAILING.", "Disk mungkin segera rusak! Segera backup & ganti.");
-                } elseif (stripos($output, "SMART support is: Disabled") !== false || stripos($output, "Not supported") !== false) { 
-                    $this->logger->log("SMART untuk {$device} tidak didukung atau dinonaktifkan, peringatan tidak dikirim.", "INFO");
+                } elseif (stripos($output, "SMART support is: Disabled") !== false || stripos($output, "Not supported") !== false) {
+                    $this->logger->log("SMART untuk {$device} tidak didukung atau dinonaktifkan (normal di cloud), peringatan tidak dikirim.", "INFO");
                 }
             }
         }
